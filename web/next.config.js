@@ -38,6 +38,18 @@ const nextConfig = {
       },
     ]
   },
+  async rewrites() {
+    return [
+      {
+        source: '/console/api/:path*',
+        destination: 'https://cloud.dify.ai/console/api/:path*',
+      },
+      {
+        source: '/api/:path*',
+        destination: 'https://cloud.dify.ai/api/:path*',
+      },
+    ]
+  },
   output: 'standalone',
 }
 
