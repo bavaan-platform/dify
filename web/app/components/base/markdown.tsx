@@ -12,7 +12,6 @@ import cn from 'classnames'
 import CopyBtn from '@/app/components/app/chat/copy-btn'
 import SVGBtn from '@/app/components/app/chat/svg'
 import Flowchart from '@/app/components/app/chat/mermaid'
-import s from '@/app/components/app/chat/style.module.css'
 
 // Available language https://github.com/react-syntax-highlighter/react-syntax-highlighter/blob/master/AVAILABLE_LANGUAGES_HLJS.MD
 const capitalizationLanguageNameMap: Record<string, string> = {
@@ -82,7 +81,6 @@ const useLazyLoad = (ref: RefObject<Element>): boolean => {
 }
 
 export function Markdown(props: { content: string; className?: string }) {
-  const [isCopied, setIsCopied] = useState(false)
   const [isSVG, setIsSVG] = useState(false)
   return (
     <div className={cn(props.className, 'markdown-body')}>
@@ -92,7 +90,7 @@ export function Markdown(props: { content: string; className?: string }) {
           RehypeKatex,
         ]}
         components={{
-          code({ node, inline, className, children, ...props }) {
+          code({ inline, className, children, ...props }) {
             const match = /language-(\w+)/.exec(className || '')
             const language = match?.[1]
             const languageShowName = getCorrectCapitalizationLanguageName(language || '')
@@ -114,7 +112,7 @@ export function Markdown(props: { content: string; className?: string }) {
                         />
                       }
                       <CopyBtn
-                        className={cn(s.copyBtn, 'mr-1')}
+                        className='mr-1'
                         value={String(children).replace(/\n$/, '')}
                         isPlain
                       />
@@ -162,14 +160,17 @@ export function Markdown(props: { content: string; className?: string }) {
               const image = node.children[0]
 
               return (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={image.properties.src}
-                  width={250}
-                  height={250}
-                  className="max-w-full h-auto align-middle border-none rounded-lg shadow-md hover:shadow-lg transition-shadow duration-300 ease-in-out mt-2 mb-2"
-                  alt={image.properties.alt}
-                />
+                <>
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={image.properties.src}
+                    width={250}
+                    height={250}
+                    className="max-w-full h-auto align-middle border-none rounded-lg shadow-md hover:shadow-lg transition-shadow duration-300 ease-in-out mt-2 mb-2"
+                    alt={image.properties.alt}
+                  />
+                  <p>{paragraph.children.slice(1)}</p>
+                </>
               )
             }
             return <p>{paragraph.children}</p>

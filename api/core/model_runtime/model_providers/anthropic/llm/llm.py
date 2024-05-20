@@ -1,4 +1,5 @@
 import base64
+import json
 import mimetypes
 from collections.abc import Generator
 from typing import Optional, Union, cast
@@ -15,6 +16,7 @@ from anthropic.types import (
     MessageStreamEvent,
     completion_create_params,
 )
+from anthropic.types.beta.tools import ToolsBetaMessage
 from httpx import Timeout
 
 from core.model_runtime.callbacks.base_callback import Callback
@@ -27,6 +29,7 @@ from core.model_runtime.entities.message_entities import (
     PromptMessageTool,
     SystemPromptMessage,
     TextPromptMessageContent,
+    ToolPromptMessage,
     UserPromptMessage,
 )
 from core.model_runtime.errors.invoke import (
@@ -70,10 +73,11 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
         :return: full response or stream response chunk generator result
         """
         # invoke model
-        return self._chat_generate(model, credentials, prompt_messages, model_parameters, stop, stream, user)
+        return self._chat_generate(model, credentials, prompt_messages, model_parameters, tools, stop, stream, user)
 
     def _chat_generate(self, model: str, credentials: dict,
-                       prompt_messages: list[PromptMessage], model_parameters: dict, stop: Optional[list[str]] = None,
+                       prompt_messages: list[PromptMessage], model_parameters: dict, 
+                       tools: Optional[list[PromptMessageTool]] = None, stop: Optional[list[str]] = None,
                        stream: bool = True, user: Optional[str] = None) -> Union[LLMResult, Generator]:
         """
         Invoke llm chat model
@@ -109,14 +113,26 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
         if system:
             extra_model_kwargs['system'] = system
 
-        # chat model
-        response = client.messages.create(
-            model=model,
-            messages=prompt_message_dicts,
-            stream=stream,
-            **model_parameters,
-            **extra_model_kwargs
-        )
+        if tools:
+            extra_model_kwargs['tools'] = [
+                self._transform_tool_prompt(tool) for tool in tools
+            ]
+            response = client.beta.tools.messages.create(
+                model=model,
+                messages=prompt_message_dicts,
+                stream=stream,
+                **model_parameters,
+                **extra_model_kwargs
+            )
+        else:
+            # chat model
+            response = client.messages.create(
+                model=model,
+                messages=prompt_message_dicts,
+                stream=stream,
+                **model_parameters,
+                **extra_model_kwargs
+            )
 
         if stream:
             return self._handle_chat_generate_stream_response(model, credentials, response, prompt_messages)
@@ -130,7 +146,7 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
         """
         Code block mode wrapper for invoking large language model
         """
-        if 'response_format' in model_parameters and model_parameters['response_format']:
+        if model_parameters.get('response_format'):
             stop = stop or []
             # chat model
             self._transform_chat_json_prompts(
@@ -147,6 +163,13 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
             model_parameters.pop('response_format')
 
         return self._invoke(model, credentials, prompt_messages, model_parameters, tools, stop, stream, user)
+
+    def _transform_tool_prompt(self, tool: PromptMessageTool) -> dict:
+        return {
+            'name': tool.name,
+            'description': tool.description,
+            'input_schema': tool.parameters
+        }
 
     def _transform_chat_json_prompts(self, model: str, credentials: dict,
                                      prompt_messages: list[PromptMessage], model_parameters: dict,
@@ -193,7 +216,18 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
         prompt = self._convert_messages_to_prompt_anthropic(prompt_messages)
 
         client = Anthropic(api_key="")
-        return client.count_tokens(prompt)
+        tokens = client.count_tokens(prompt)
+
+        tool_call_inner_prompts_tokens_map = {
+            'claude-3-opus-20240229': 395,
+            'claude-3-haiku-20240307': 264,
+            'claude-3-sonnet-20240229': 159
+        }
+
+        if model in tool_call_inner_prompts_tokens_map and tools:
+            tokens += tool_call_inner_prompts_tokens_map[model]
+
+        return tokens
 
     def validate_credentials(self, model: str, credentials: dict) -> None:
         """
@@ -219,7 +253,7 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
         except Exception as ex:
             raise CredentialsValidateFailedError(str(ex))
 
-    def _handle_chat_generate_response(self, model: str, credentials: dict, response: Message,
+    def _handle_chat_generate_response(self, model: str, credentials: dict, response: Union[Message, ToolsBetaMessage],
                                        prompt_messages: list[PromptMessage]) -> LLMResult:
         """
         Handle llm chat response
@@ -232,8 +266,23 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
         """
         # transform assistant message to prompt message
         assistant_prompt_message = AssistantPromptMessage(
-            content=response.content[0].text
+            content='',
+            tool_calls=[]
         )
+
+        for content in response.content:
+            if content.type == 'text':
+                assistant_prompt_message.content += content.text
+            elif content.type == 'tool_use':
+                tool_call = AssistantPromptMessage.ToolCall(
+                    id=content.id,
+                    type='function',
+                    function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                        name=content.name,
+                        arguments=json.dumps(content.input)
+                    )
+                )
+                assistant_prompt_message.tool_calls.append(tool_call)
 
         # calculate num tokens
         if response.usage:
@@ -275,10 +324,32 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
         output_tokens = 0
         finish_reason = None
         index = 0
+
+        tool_calls: list[AssistantPromptMessage.ToolCall] = []
+
         for chunk in response:
             if isinstance(chunk, MessageStartEvent):
-                return_model = chunk.message.model
-                input_tokens = chunk.message.usage.input_tokens
+                if hasattr(chunk, 'content_block'):
+                    content_block = chunk.content_block
+                    if isinstance(content_block, dict):
+                        if content_block.get('type') == 'tool_use':
+                            tool_call = AssistantPromptMessage.ToolCall(
+                                id=content_block.get('id'),
+                                type='function',
+                                function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                    name=content_block.get('name'),
+                                    arguments=''
+                                )
+                            )
+                            tool_calls.append(tool_call)
+                elif hasattr(chunk, 'delta'):
+                    delta = chunk.delta
+                    if isinstance(delta, dict) and len(tool_calls) > 0:
+                        if delta.get('type') == 'input_json_delta':
+                            tool_calls[-1].function.arguments += delta.get('partial_json', '')
+                elif chunk.message:
+                    return_model = chunk.message.model
+                    input_tokens = chunk.message.usage.input_tokens
             elif isinstance(chunk, MessageDeltaEvent):
                 output_tokens = chunk.usage.output_tokens
                 finish_reason = chunk.delta.stop_reason
@@ -286,13 +357,19 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
                 # transform usage
                 usage = self._calc_response_usage(model, credentials, input_tokens, output_tokens)
 
+                # transform empty tool call arguments to {}
+                for tool_call in tool_calls:
+                    if not tool_call.function.arguments:
+                        tool_call.function.arguments = '{}'
+
                 yield LLMResultChunk(
                     model=return_model,
                     prompt_messages=prompt_messages,
                     delta=LLMResultChunkDelta(
                         index=index + 1,
                         message=AssistantPromptMessage(
-                            content=''
+                            content='',
+                            tool_calls=tool_calls
                         ),
                         finish_reason=finish_reason,
                         usage=usage
@@ -331,7 +408,7 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
             "max_retries": 1,
         }
 
-        if 'anthropic_api_url' in credentials and credentials['anthropic_api_url']:
+        if credentials.get('anthropic_api_url'):
             credentials['anthropic_api_url'] = credentials['anthropic_api_url'].rstrip('/')
             credentials_kwargs['base_url'] = credentials['anthropic_api_url']
 
@@ -342,74 +419,103 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
         Convert prompt messages to dict list and system
         """
         system = ""
-        prompt_message_dicts = []
-
+        first_loop = True
         for message in prompt_messages:
             if isinstance(message, SystemPromptMessage):
-                system += message.content + ("\n" if not system else "")
-            else:
-                prompt_message_dicts.append(self._convert_prompt_message_to_dict(message))
+                message.content = message.content.strip()
+                if first_loop:
+                    system = message.content
+                    first_loop = False
+                else:
+                    system += "\n"
+                    system += message.content
+
+        prompt_message_dicts = []
+        for message in prompt_messages:
+            if not isinstance(message, SystemPromptMessage):
+                if isinstance(message, UserPromptMessage):
+                    message = cast(UserPromptMessage, message)
+                    if isinstance(message.content, str):
+                        message_dict = {"role": "user", "content": message.content}
+                        prompt_message_dicts.append(message_dict)
+                    else:
+                        sub_messages = []
+                        for message_content in message.content:
+                            if message_content.type == PromptMessageContentType.TEXT:
+                                message_content = cast(TextPromptMessageContent, message_content)
+                                sub_message_dict = {
+                                    "type": "text",
+                                    "text": message_content.data
+                                }
+                                sub_messages.append(sub_message_dict)
+                            elif message_content.type == PromptMessageContentType.IMAGE:
+                                message_content = cast(ImagePromptMessageContent, message_content)
+                                if not message_content.data.startswith("data:"):
+                                    # fetch image data from url
+                                    try:
+                                        image_content = requests.get(message_content.data).content
+                                        mime_type, _ = mimetypes.guess_type(message_content.data)
+                                        base64_data = base64.b64encode(image_content).decode('utf-8')
+                                    except Exception as ex:
+                                        raise ValueError(f"Failed to fetch image data from url {message_content.data}, {ex}")
+                                else:
+                                    data_split = message_content.data.split(";base64,")
+                                    mime_type = data_split[0].replace("data:", "")
+                                    base64_data = data_split[1]
+
+                                if mime_type not in ["image/jpeg", "image/png", "image/gif", "image/webp"]:
+                                    raise ValueError(f"Unsupported image type {mime_type}, "
+                                                    f"only support image/jpeg, image/png, image/gif, and image/webp")
+
+                                sub_message_dict = {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": mime_type,
+                                        "data": base64_data
+                                    }
+                                }
+                                sub_messages.append(sub_message_dict)
+                        prompt_message_dicts.append({"role": "user", "content": sub_messages})
+                elif isinstance(message, AssistantPromptMessage):
+                    message = cast(AssistantPromptMessage, message)
+                    content = []
+                    if message.tool_calls:
+                        for tool_call in message.tool_calls:
+                            content.append({
+                                "type": "tool_use",
+                                "id": tool_call.id,
+                                "name": tool_call.function.name,
+                                "input": json.loads(tool_call.function.arguments)
+                            })
+                    if message.content:
+                        content.append({
+                            "type": "text",
+                            "text": message.content
+                        })
+                    
+                    if prompt_message_dicts[-1]["role"] == "assistant":
+                        prompt_message_dicts[-1]["content"].extend(content)
+                    else:
+                        prompt_message_dicts.append({
+                            "role": "assistant",
+                            "content": content
+                        })
+                elif isinstance(message, ToolPromptMessage):
+                    message = cast(ToolPromptMessage, message)
+                    message_dict = {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": message.tool_call_id,
+                            "content": message.content
+                        }]
+                    }
+                    prompt_message_dicts.append(message_dict)
+                else:
+                    raise ValueError(f"Got unknown type {message}")
 
         return system, prompt_message_dicts
-
-    def _convert_prompt_message_to_dict(self, message: PromptMessage) -> dict:
-        """
-        Convert PromptMessage to dict
-        """
-        if isinstance(message, UserPromptMessage):
-            message = cast(UserPromptMessage, message)
-            if isinstance(message.content, str):
-                message_dict = {"role": "user", "content": message.content}
-            else:
-                sub_messages = []
-                for message_content in message.content:
-                    if message_content.type == PromptMessageContentType.TEXT:
-                        message_content = cast(TextPromptMessageContent, message_content)
-                        sub_message_dict = {
-                            "type": "text",
-                            "text": message_content.data
-                        }
-                        sub_messages.append(sub_message_dict)
-                    elif message_content.type == PromptMessageContentType.IMAGE:
-                        message_content = cast(ImagePromptMessageContent, message_content)
-                        if not message_content.data.startswith("data:"):
-                            # fetch image data from url
-                            try:
-                                image_content = requests.get(message_content.data).content
-                                mime_type, _ = mimetypes.guess_type(message_content.data)
-                                base64_data = base64.b64encode(image_content).decode('utf-8')
-                            except Exception as ex:
-                                raise ValueError(f"Failed to fetch image data from url {message_content.data}, {ex}")
-                        else:
-                            data_split = message_content.data.split(";base64,")
-                            mime_type = data_split[0].replace("data:", "")
-                            base64_data = data_split[1]
-
-                        if mime_type not in ["image/jpeg", "image/png", "image/gif", "image/webp"]:
-                            raise ValueError(f"Unsupported image type {mime_type}, "
-                                             f"only support image/jpeg, image/png, image/gif, and image/webp")
-
-                        sub_message_dict = {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime_type,
-                                "data": base64_data
-                            }
-                        }
-                        sub_messages.append(sub_message_dict)
-
-                message_dict = {"role": "user", "content": sub_messages}
-        elif isinstance(message, AssistantPromptMessage):
-            message = cast(AssistantPromptMessage, message)
-            message_dict = {"role": "assistant", "content": message.content}
-        elif isinstance(message, SystemPromptMessage):
-            message = cast(SystemPromptMessage, message)
-            message_dict = {"role": "system", "content": message.content}
-        else:
-            raise ValueError(f"Got unknown type {message}")
-
-        return message_dict
 
     def _convert_one_message_to_text(self, message: PromptMessage) -> str:
         """
@@ -445,6 +551,8 @@ class AnthropicLargeLanguageModel(LargeLanguageModel):
                         message_text += f"{ai_prompt} [IMAGE]"
         elif isinstance(message, SystemPromptMessage):
             message_text = content
+        elif isinstance(message, ToolPromptMessage):
+            message_text = f"{human_prompt} {message.content}"
         else:
             raise ValueError(f"Got unknown type {message}")
 

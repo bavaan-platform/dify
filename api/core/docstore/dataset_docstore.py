@@ -84,7 +84,7 @@ class DatasetDocumentStore:
             if not isinstance(doc, Document):
                 raise ValueError("doc must be a Document")
 
-            segment_document = self.get_document(doc_id=doc.metadata['doc_id'], raise_error=False)
+            segment_document = self.get_document_segment(doc_id=doc.metadata['doc_id'])
 
             # NOTE: doc could already exist in the store, but we overwrite it
             if not allow_update and segment_document:
@@ -121,13 +121,13 @@ class DatasetDocumentStore:
                     enabled=False,
                     created_by=self._user_id,
                 )
-                if 'answer' in doc.metadata and doc.metadata['answer']:
+                if doc.metadata.get('answer'):
                     segment_document.answer = doc.metadata.pop('answer', '')
 
                 db.session.add(segment_document)
             else:
                 segment_document.content = doc.page_content
-                if 'answer' in doc.metadata and doc.metadata['answer']:
+                if doc.metadata.get('answer'):
                     segment_document.answer = doc.metadata.pop('answer', '')
                 segment_document.index_node_hash = doc.metadata['doc_hash']
                 segment_document.word_count = len(doc.page_content)
