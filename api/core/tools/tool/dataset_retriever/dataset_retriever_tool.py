@@ -2,12 +2,13 @@
 from pydantic import BaseModel, Field
 
 from core.rag.datasource.retrieval_service import RetrievalService
+from core.rag.retrieval.retrival_methods import RetrievalMethod
 from core.tools.tool.dataset_retriever.dataset_retriever_base_tool import DatasetRetrieverBaseTool
 from extensions.ext_database import db
 from models.dataset import Dataset, Document, DocumentSegment
 
 default_retrieval_model = {
-    'search_method': 'semantic_search',
+    'search_method': RetrievalMethod.SEMANTIC_SEARCH,
     'reranking_enable': False,
     'reranking_model': {
         'reranking_provider_name': '',
@@ -105,9 +106,9 @@ class DatasetRetrieverTool(DatasetRetrieverBaseTool):
                                                                                            float('inf')))
                 for segment in sorted_segments:
                     if segment.answer:
-                        document_context_list.append(f'question:{segment.content} answer:{segment.answer}')
+                        document_context_list.append(f'question:{segment.get_sign_content()} answer:{segment.answer}')
                     else:
-                        document_context_list.append(segment.content)
+                        document_context_list.append(segment.get_sign_content())
                 if self.return_resource:
                     context_list = []
                     resource_number = 1
